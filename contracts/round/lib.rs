@@ -2,11 +2,15 @@
 
 #[ink::contract]
 mod fragments_round {
+    use fa_nft::FaNftRef;
     use ink::prelude::vec::Vec;
+    use ink::ToAccountId;
 
     #[ink(storage)]
     pub struct FragmentsRound {
         fragment_basics: Vec<FragmentBasic>,
+        /// the FA Nft contract AccountId
+        fa_nft: AccountId,
     }
 
     #[ink::scale_derive(Decode, Encode, TypeInfo)]
@@ -47,9 +51,16 @@ mod fragments_round {
 
     impl FragmentsRound {
         #[ink(constructor)]
-        pub fn new(fragment_basics: Vec<FragmentBasic>) -> Self {
+        pub fn new(fragment_basics: Vec<FragmentBasic>, fa_nft_code_hash: Hash) -> Self {
+            let fa_nft = FaNftRef::new()
+                .code_hash(fa_nft_code_hash)
+                .endowment(0)
+                .salt_bytes([0xde, 0xad, 0xbe, 0xef])
+                .instantiate();
+
             Self {
                 fragment_basics: fragment_basics,
+                fa_nft: fa_nft.to_account_id(),
             }
         }
 

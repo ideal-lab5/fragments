@@ -6,6 +6,7 @@ edition = "2021"
 
 [dependencies]
 ink = { version = "5.0.0", default-features = false }
+fa-nft = { path = "../fa-nft", default-features = false, features = ["ink-as-dependency"] }
 
 [lib]
 path = "lib.rs"
@@ -14,5 +15,6 @@ path = "lib.rs"
 default = ["std"]
 std = [
     "ink/std",
+    "fa-nft/std"
 ]
 ink-as-dependency = []

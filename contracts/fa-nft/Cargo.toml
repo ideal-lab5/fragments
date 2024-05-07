@@ -1,5 +1,6 @@
 [package]
-name = "fa_nft"
+name = "fa-nft"
+description = "Fragment Acknowledgement NFT"
 version = "0.1.0"
 authors = ["juan@idealabs.network"]
 edition = "2021"
