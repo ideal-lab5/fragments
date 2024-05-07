@@ -146,7 +146,10 @@ mod fragments_round {
 
         fn mock_round() -> FragmentsRound {
             let fragment_basics = [mock_fragment_basic()].to_vec();
-            FragmentsRound::new(fragment_basics)
+            FragmentsRound {
+                fragment_basics: fragment_basics,
+                fa_nft: ink::primitives::AccountId::from([0x01; 32]),
+            }
         }
 
         #[ink::test]
