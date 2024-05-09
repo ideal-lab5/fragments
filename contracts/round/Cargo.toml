@@ -7,6 +7,9 @@ edition = "2021"
 [dependencies]
 ink = { version = "5.0.0", default-features = false }
 fa-nft = { path = "../fa-nft", default-features = false, features = ["ink-as-dependency"] }
+ckb-merkle-mountain-range = "0.5.2"
+sha3 = "0.10.8"
+serde = { version = "1.0.188", features = ["alloc", "derive"] }
 
 [lib]
 path = "lib.rs"
