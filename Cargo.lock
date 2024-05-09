@@ -274,7 +274,6 @@ dependencies = [
  "ckb-merkle-mountain-range",
  "fa-nft",
  "ink",
- "serde",
  "sha3",
 ]
 

@@ -3,39 +3,34 @@
 #[ink::contract]
 mod fragments_round {
     use ckb_merkle_mountain_range::{Merge, MerkleProof, Result as MMRResult};
-    use core::f32::consts::E;
     use core::marker::PhantomData;
-    use fa_nft::FaNftRef;
-    use ink::prelude::vec::Vec;
-    use ink::{storage::traits::StorageLayout, ToAccountId};
+    use ink::prelude::{vec, vec::Vec};
     use sha3::Digest;
 
     #[ink(storage)]
     pub struct FragmentsRound {
-        fragment_basics: Vec<FragmentBasic>,
+        fragment_details: Vec<FragmentDetails>,
         /// the FA Nft contract AccountId
         fa_nft: AccountId,
-        mmr_root: Leaf,
+        mmr_root: Vec<u8>,
     }
 
     #[ink::scale_derive(Decode, Encode, TypeInfo)]
     #[derive(Debug, Clone, PartialEq)]
-    pub struct FragmentBasic {
+    pub struct FragmentDetails {
         cid: u32,
         release_block: u32,
     }
 
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
-    #[derive(
-        StorageLayout, Eq, PartialEq, Clone, Debug, Default, serde::Serialize, serde::Deserialize,
-    )]
+    #[derive(PartialEq, Clone, Debug, Default)]
     pub struct Leaf(pub Vec<u8>);
     impl From<Vec<u8>> for Leaf {
         fn from(data: Vec<u8>) -> Self {
             let mut hasher = sha3::Sha3_256::default();
             hasher.update(&data);
             let hash = hasher.finalize();
-            Leaf(hash.to_vec().into())
+            Leaf(hash.to_vec())
         }
     }
 
@@ -49,7 +44,7 @@ mod fragments_round {
             hasher.update(&lhs.0);
             hasher.update(&rhs.0);
             let hash = hasher.finalize();
-            Ok(Leaf(hash.to_vec().into()))
+            Ok(Leaf(hash.to_vec()))
         }
     }
 
@@ -60,166 +55,138 @@ mod fragments_round {
         merge: PhantomData<M>,
     }
 
-    impl Into<MerkleProof<Leaf, MergeLeaves>> for Proof<Leaf, MergeLeaves> {
-        fn into(self) -> MerkleProof<Leaf, MergeLeaves> {
-            MerkleProof::<Leaf, MergeLeaves>::new(self.mmr_size, self.proof)
+    impl From<Proof<Leaf, MergeLeaves>> for MerkleProof<Leaf, MergeLeaves> {
+        fn from(val: Proof<Leaf, MergeLeaves>) -> Self {
+            MerkleProof::<Leaf, MergeLeaves>::new(val.mmr_size, val.proof)
+        }
+    }
+
+    impl From<MerkleProof<Leaf, MergeLeaves>> for Proof<Leaf, MergeLeaves> {
+        fn from(mmr_proof: MerkleProof<Leaf, MergeLeaves>) -> Self {
+            Proof {
+                mmr_size: mmr_proof.mmr_size(),
+                proof: mmr_proof.proof_items().to_vec(),
+                merge: PhantomData,
+            }
         }
     }
 
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[derive(PartialEq, Debug)]
     pub enum Error {
-        FragmentNotAvailable,
-        FragmentBasicNotFound,
+        DetailsNotFound,
         /// The fragment can't be proven. This does not mean that the fragment is invalid.
         /// But something went wrong during the proof verification.
-        FragmentCantBeProven,
-        FragmentProofInvalid,
+        CantBeProven,
+        ProofInvalid,
     }
 
-    struct FragmentDetail {
-        lifespan: u32,
-    }
-
-    // TODO remove this default implementation once real implementation is done
-    impl Default for FragmentDetail {
-        fn default() -> Self {
-            Self { lifespan: 10 }
-        }
-    }
-
-    struct Fragment {
-        basic: FragmentBasic,
-        detail: Option<FragmentDetail>,
-    }
-
-    impl Fragment {
-        fn is_available(&self) -> bool {
-            self.detail.is_some()
-        }
-    }
-
+    /// The `FragmentsRound` struct represents a round of fragments.
+    /// It contains information about the fragment details, the MMR root, and the Fragment Acknowledge NFT account ID.
     impl FragmentsRound {
+        /// Creates a new instance of `FragmentsRound`.
+        ///
+        /// # Arguments
+        ///
+        /// * `fragment_details` - A list of `FragmentDetails` representing the details of each fragment.
+        /// * `mmr_root` - The root of the MMR (Merkle Mountain Range), where each leaf represents a fragment.
+        /// * `fa_nft` - The account ID of the deployed Fragment Acknowledge NFT.
+        ///
+        /// # Returns
+        ///
+        /// A new instance of `FragmentsRound`.
         #[ink(constructor)]
-        pub fn new(fragment_basics: Vec<FragmentBasic>, mmr_root: Leaf, fa_nft: AccountId) -> Self {
-            // let store = MemStore::default();
-            // let mut mmr = MemMMR::<_, MergeLeaves>::new(0, store);
-
-            // let fa_nft = FaNftRef::new()
-            //     .code_hash(fa_nft_code_hash)
-            //     .endowment(0)
-            //     .salt_bytes([0xde, 0xad, 0xbe, 0xef])
-            //     .instantiate();
-
+        pub fn new(
+            fragment_details: Vec<FragmentDetails>,
+            mmr_root: Vec<u8>,
+            fa_nft: AccountId,
+        ) -> Self {
             Self {
-                fragment_basics,
+                fragment_details,
                 fa_nft,
                 mmr_root,
             }
         }
 
-        /// Return all the Fragments in this round.
+        /// Returns all the fragments in this round.
+        ///
+        /// # Returns
+        ///
+        /// A vector of `FragmentDetails` representing all the fragments in this round.
         #[ink(message)]
-        pub fn get_fragments(&self) -> Vec<FragmentBasic> {
-            self.fragment_basics.clone()
+        pub fn get_fragments(&self) -> Vec<FragmentDetails> {
+            self.fragment_details.clone()
         }
 
-        /// Check if the Fragment is available to be claimed by the caller.
+        /// Checks if the fragment is available to be claimed by the caller.
         /// If it is available, it mints a Fragment Acknowledgement NFT.
+        ///
+        /// # Arguments
+        ///
+        /// * `proof` - The proof of inclusion for the fragment in the MMR.
+        /// * `pos` - The node position of the leaf that represents the fragment in the MMR.
+        /// * `hash` - The hash of the fragment.
+        ///
+        /// # Returns
+        ///
+        /// An `Ok` result if the fragment is successfully claimed and the NFT is minted, or an `Err` result with an `Error` if the claim fails.
         #[ink(message)]
         pub fn claim_fragment(
             &self,
             proof: Proof<Leaf, MergeLeaves>,
             pos: u64,
-            otp: Vec<u8>,
+            hash: Vec<u8>,
         ) -> Result<(), Error> {
             let mmr_proof: MerkleProof<Leaf, MergeLeaves> = proof.into();
             let verifies = mmr_proof
-                .verify(self.mmr_root.clone(), vec![(pos, Leaf::from(otp))])
-                .map_err(|_| Error::FragmentCantBeProven)?;
+                .verify(Leaf(self.mmr_root.clone()), vec![(pos, Leaf::from(hash))])
+                .map_err(|_| Error::CantBeProven)?;
             if !verifies {
-                return Err(Error::FragmentProofInvalid);
+                return Err(Error::ProofInvalid);
             }
-            // let mmr_proof: MerkleProof<Leaf, MergeLeaves> = mmr_proof.into();
-            // let fragment = self.get_fragment(fragment_cid)?;
 
-            // if fragment.is_available() {
-            //     // Code to mint a Fragment Acknowledgement NFT
-            //     Ok(())
-            // } else {
-            //     Err(Error::FragmentNotAvailable)
-            // }
-            Ok(())
+            self.mint_fragment_acknowledgement(pos)
         }
 
-        /// Check if the caller is eligible to claim the reward.
-        /// If it is, it calculates the reward and transfers it to the caller.
+        /// Checks if the caller is eligible to claim the reward.
+        /// If eligible, it calculates the reward and transfers it to the caller.
         #[ink(message)]
         pub fn get_reward(&self) {}
 
-        /// Get the weight of the Fragment.
-        /// The weight is used to calculate the reward.
-        /// It's a number between 0 and 255.
-        fn get_fragment_weight(&self, _fragment: &Fragment) -> Result<u8, Error> {
-            todo!()
-        }
-
-        fn mint_fragment_acknowledgement(
-            &self,
-            _fragment: Fragment,
-            _weight: u8,
-        ) -> Result<(), Error> {
-            todo!()
-        }
-
-        fn get_fragment(&self, fragment_cid: u32) -> Result<Fragment, Error> {
-            Ok(Fragment {
-                basic: self.get_fragment_basic(fragment_cid)?,
-                detail: self.get_fragment_detail(fragment_cid)?,
-            })
-        }
-
-        fn get_fragment_detail(&self, fragment_cid: u32) -> Result<Option<FragmentDetail>, Error> {
-            if self.env().block_number() >= self.get_fragment_basic(fragment_cid)?.release_block {
-                // Code to mint a Fragment Acknowledgement NFT
-                Ok(Some(FragmentDetail::default()))
-            } else {
-                Ok(None)
-            }
-        }
-
-        fn get_fragment_basic(&self, fragment_cid: u32) -> Result<FragmentBasic, Error> {
-            if let Some(fragment_basic) = self
-                .fragment_basics
-                .iter()
-                .find(|fragment| fragment.cid == fragment_cid)
-            {
-                Ok(fragment_basic.clone())
-            } else {
-                Err(Error::FragmentBasicNotFound)
-            }
+        /// Mints a fragment acknowledgement for the given position.
+        ///
+        /// # Arguments
+        ///
+        /// * `_pos` - The position of the fragment in the MMR.
+        ///
+        /// # Returns
+        ///
+        /// An `Ok` result if the fragment acknowledgement is successfully minted, or an `Err` result with an `Error` if minting fails.
+        fn mint_fragment_acknowledgement(&self, _pos: u64) -> Result<(), Error> {
+            // todo
+            Ok(())
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use ckb_merkle_mountain_range::util::{MemMMR, MemStore};
         use ink::primitives::AccountId;
         use std::vec;
 
-        fn mock_fragment_basic() -> FragmentBasic {
-            FragmentBasic {
+        fn mock_fragment_basic() -> FragmentDetails {
+            FragmentDetails {
                 cid: 1,
                 release_block: 11,
             }
         }
 
-        fn mock_round() -> FragmentsRound {
-            let fragment_basics = [mock_fragment_basic()].to_vec();
+        fn mock_round(mmr_root: Option<Vec<u8>>) -> FragmentsRound {
             FragmentsRound {
-                fragment_basics: fragment_basics,
+                fragment_details: [mock_fragment_basic()].to_vec(),
                 fa_nft: AccountId::from([0x01; 32]),
-                mmr_root: Leaf::default(),
+                mmr_root: mmr_root.unwrap_or(Vec::<u8>::default()),
             }
         }
 
@@ -233,34 +200,85 @@ mod fragments_round {
 
         #[ink::test]
         fn it_returns_fragments() {
-            let round = mock_round();
+            let round = mock_round(None);
             assert_eq!(round.get_fragments(), [mock_fragment_basic()].to_vec());
         }
 
         #[ink::test]
-        fn it_cant_claim_fragment_before_decrypting_block() {
-            let round = mock_round();
-            ink::env::test::set_block_number::<ink::env::DefaultEnvironment>(10);
+        fn it_cant_claim_fragment_with_invalid_proof() {
+            let round = mock_round(None);
             assert_eq!(
                 round.claim_fragment(mock_proof(), 0, vec![0x01]),
-                Err(Error::FragmentNotAvailable)
+                Err(Error::ProofInvalid)
             );
         }
 
+        /// Test that we can claim a fragment by submitting a valid proof and leaf (pos + opt).
+        /// First we replicate what would happen off-chain:
+        /// 1. Create an MMR and its leafs.
+        /// 2. Get its root
+        /// 3. Create a new FragmentRound with the MMR root.
+        /// 4. Generate a proof for a leaf.
+        ///
+        /// Finally we can assert that the fragment was claimed successfully.
         #[ink::test]
-        fn it_can_claim_fragment_after_decrypting_block() {
-            let round = mock_round();
-            ink::env::test::set_block_number::<ink::env::DefaultEnvironment>(11);
-            assert_eq!(round.claim_fragment(mock_proof(), 0, vec![0x01]), Ok(()));
-        }
+        fn it_can_claim_fragment_with_valid_proof() {
+            /// Mock some HASH
+            fn mock_hash_from_elem(elem: u32) -> Vec<u8> {
+                sha3::Sha3_256::digest(&elem.to_be_bytes()).to_vec()
+            }
 
-        #[ink::test]
-        fn it_cant_claim_fragmen_if_it_does_not_exist() {
-            let round = mock_round();
-            ink::env::test::set_block_number::<ink::env::DefaultEnvironment>(11);
+            // Let's create a MMR with 8 leafs.
+            let store = MemStore::default();
+            let mut mmr = MemMMR::<_, MergeLeaves>::new(0, store);
+
+            // 1. Create an MMR and its leafs.
+            // We add 8 leafs to the MMR, each with a mocked HASH that uses the element as the seed.
+            // The MMR has 14 nodes and looks like this:
+            //           14
+            //        /       \
+            //      6          13
+            //    /   \       /   \
+            //   2     5     9     12
+            //  / \   /  \  / \   /  \
+            // 0   1 3   4 7   8 10  11
+            //
+            // `positions` maps the element to its leaf position in the MMR.
+            // It looks like this:
+            //  [
+            //   0 => 0,
+            //   1 => 1,
+            //   2 => 3,
+            //   3 => 4,
+            //   4 => 7,
+            //   5 => 8,
+            //   6 => 10,
+            //   7 => 11,
+            //  ]
+            let positions: Vec<u64> = (0u32..8)
+                .map(|i| mmr.push(Leaf::from(mock_hash_from_elem(i))).unwrap())
+                .collect();
+
+            // 2. Get its root
+            let root = mmr.get_root().expect("get root");
+
+            // 3. Create a new FragmentRound with the MMR root.
+            let round = mock_round(Some(root.0));
+
+            // 4. Generate a proof for a leaf.
+            // The element that we know the proof for is 5.
+            let proof_elem: u32 = 5;
+            let proof = mmr
+                .gen_proof(vec![positions[proof_elem as usize]])
+                .expect("gen proof");
+
             assert_eq!(
-                round.claim_fragment(mock_proof(), 0, vec![0x01]),
-                Err(Error::FragmentBasicNotFound)
+                round.claim_fragment(
+                    proof.into(),
+                    positions[proof_elem as usize],
+                    mock_hash_from_elem(proof_elem)
+                ),
+                Ok(())
             );
         }
     }
