@@ -151,7 +151,7 @@ mod fragments_round {
         /// Checks if the caller is eligible to claim the reward.
         /// If eligible, it calculates the reward and transfers it to the caller.
         #[ink(message)]
-        pub fn get_reward(&self) {}
+        pub fn claim_reward(&self) {}
 
         /// Mints a fragment acknowledgement for the given position.
         ///
