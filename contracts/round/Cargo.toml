@@ -1,0 +1,26 @@
+[package]
+name = "fragments-round"
+version = "0.1.0"
+authors = ["juan@idealabs.network"]
+edition = "2021"
+
+[dependencies]
+ink = { version = "5.0.0", default-features = false }
+fa-nft = { path = "../fa-nft", default-features = false, features = ["ink-as-dependency"] }
+ckb-merkle-mountain-range = { version = "0.5.2", default-features = false }
+sha3 = { version = "0.10.8", default-features = false }
+ownable = { package = "trait-ownable", path = "../traits/ownable", default-features = false, version = "0.1.0" }
+transferable = { package = "trait-transferable", path = "../traits/transferable", default-features = false, version = "0.1.0" }
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["std"]
+std = [
+    "ink/std",
+    "fa-nft/std",
+    "ckb-merkle-mountain-range/std",
+    "sha3/std",
+]
+ink-as-dependency = []

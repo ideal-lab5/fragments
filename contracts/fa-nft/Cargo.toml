@@ -1,0 +1,21 @@
+[package]
+name = "fa-nft"
+description = "Fragment Acknowledgement NFT"
+version = "0.1.0"
+authors = ["juan@idealabs.network"]
+edition = "2021"
+
+[dependencies]
+ink = { version = "5.0.0", default-features = false }
+ownable = { package = "trait-ownable", version = "0.1.0", path = "../traits/ownable", default-features = false }
+transferable = { package = "trait-transferable", version = "0.1.0", path = "../traits/transferable", default-features = false }
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["std"]
+std = [
+    "ink/std"
+]
+ink-as-dependency = []
