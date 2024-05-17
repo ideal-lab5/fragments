@@ -4,12 +4,8 @@
 //!
 //! ## Warning
 //!
-//! This contract is an *example*. It is neither audited nor endorsed for production use.
+//! This contract is neither audited nor endorsed for production use.
 //! Do **not** rely on it to keep anything of value secure.
-//!
-//! ## Overview
-//!
-//! This contract demonstrates how to build non-fungible or unique tokens using ink!.
 //!
 //! ## Error Handling
 //!
@@ -51,26 +47,52 @@
 //! token.
 
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
+pub use self::fa_nft::Error;
 pub use self::fa_nft::FaNftRef;
 
 #[ink::contract]
 mod fa_nft {
-    use ink::storage::Mapping;
+    use ink::{
+        env::hash::{Blake2x128, CryptoHash},
+        scale::Encode,
+        storage::Mapping,
+    };
+    use ownable::Ownable;
+    use transferable::Transferable;
 
     /// A token ID.
-    pub type TokenId = u32;
+    pub type TokenId = u64;
 
-    #[ink(storage)]
-    #[derive(Default)]
-    pub struct FaNft {
-        /// Mapping from token to owner.
-        token_owner: Mapping<TokenId, AccountId>,
-        /// Mapping from token to approvals users.
-        token_approvals: Mapping<TokenId, AccountId>,
-        /// Mapping from owner to number of owned token.
-        owned_tokens_count: Mapping<AccountId, u32>,
-        /// Mapping from owner to operator approvals.
-        operator_approvals: Mapping<(AccountId, AccountId), ()>,
+    pub type FragmentCid = u32;
+
+    struct TokenRef(FragmentCid, AccountId, BlockNumber);
+
+    impl From<TokenRef> for TokenId {
+        fn from(input: TokenRef) -> Self {
+            // TODO: use a cheaper hash method
+            let mut output = [0u8; 16];
+            Blake2x128::hash(
+                &[
+                    &input.0.encode()[..],
+                    &input.1.encode()[..],
+                    &input.2.encode()[..],
+                ]
+                .concat(),
+                &mut output,
+            );
+            u64::from_be_bytes(output[0..8].try_into().unwrap())
+        }
+    }
+
+    /// Information about a fragment acknowledgment.
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
+    #[derive(Default, Debug, PartialEq)]
+    #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
+    pub struct FragmentAcknowledgement {
+        /// The fragment CID that was acknowledged.
+        fragment_cid: FragmentCid,
+        /// The block number when the fragment was acknowledged.
+        block_number: BlockNumber,
     }
 
     #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -83,6 +105,8 @@ mod fa_nft {
         CannotInsert,
         CannotFetchValue,
         NotAllowed,
+        NotContractOwner,
+        TransferFailed,
     }
 
     /// Event emitted when a token transfer occurs.
@@ -118,11 +142,67 @@ mod fa_nft {
         approved: bool,
     }
 
+    #[ink(storage)]
+    pub struct FaNft {
+        /// Mapping from token to owner.
+        token_owner: Mapping<TokenId, AccountId>,
+        /// Mapping from token to approvals users.
+        token_approvals: Mapping<TokenId, AccountId>,
+        /// Mapping from owner to number of owned token.
+        owned_tokens_count: Mapping<AccountId, u32>,
+        /// Mapping from owner to operator approvals.
+        operator_approvals: Mapping<(AccountId, AccountId), ()>,
+        /// The account ID of the contract owner.
+        contract_owner: AccountId,
+        /// Mapping from token to fragment acknowledgments.
+        fragment_acknowledgments: Mapping<TokenId, FragmentAcknowledgement>,
+    }
+
+    impl Ownable for FaNft {
+        #[ink(message)]
+        fn owner(&self) -> AccountId {
+            self.contract_owner
+        }
+
+        #[ink(message)]
+        fn is_owner(&self, account: AccountId) -> bool {
+            self.contract_owner == account
+        }
+
+        #[ink(message)]
+        fn renounce_ownership(&mut self) {
+            self.ensure_owner();
+            self.contract_owner = AccountId::from([0x0; 32]);
+        }
+
+        #[ink(message)]
+        fn transfer_ownership(&mut self, new_owner: AccountId) {
+            self.ensure_owner();
+            self.contract_owner = new_owner;
+        }
+    }
+
+    impl Transferable for FaNft {
+        #[ink(message)]
+        fn transfer_balance(&mut self, to: AccountId, value: Balance) {
+            self.ensure_owner();
+            self.env().transfer(to, value).unwrap();
+        }
+    }
+
     impl FaNft {
         /// Creates a new ERC-721 token contract.
         #[ink(constructor)]
         pub fn new() -> Self {
-            Default::default()
+            Self {
+                token_owner: Default::default(),
+                token_approvals: Default::default(),
+                owned_tokens_count: Default::default(),
+                operator_approvals: Default::default(),
+                // deployer becomes owner
+                contract_owner: Self::env().caller(),
+                fragment_acknowledgments: Default::default(),
+            }
         }
 
         /// Returns the balance of the owner.
@@ -187,15 +267,32 @@ mod fa_nft {
 
         /// Creates a new token.
         #[ink(message)]
-        pub fn mint(&mut self, id: TokenId) -> Result<(), Error> {
-            let caller = self.env().caller();
-            self.add_token_to(&caller, id)?;
+        pub fn mint(
+            &mut self,
+            fragment_cid: FragmentCid,
+            owner: AccountId,
+            block_number: BlockNumber,
+        ) -> Result<TokenId, Error> {
+            self.ensure_owner();
+
+            let id = TokenRef(fragment_cid, owner, block_number).into();
+
+            // store the fragment acknowledgment info
+            self.fragment_acknowledgments.insert(
+                id,
+                &FragmentAcknowledgement {
+                    fragment_cid,
+                    block_number,
+                },
+            );
+
+            self.add_token_to(&owner, id)?;
             self.env().emit_event(Transfer {
                 from: Some(AccountId::from([0x0; 32])),
-                to: Some(caller),
+                to: Some(owner),
                 id,
             });
-            Ok(())
+            Ok(id)
         }
 
         /// Deletes an existing token. Only the owner can burn the token.
@@ -227,6 +324,25 @@ mod fa_nft {
             });
 
             Ok(())
+        }
+
+        /// Returns the fragment acknowledgment and token owner for the given token ID.
+        #[ink(message)]
+        pub fn get_fa_info(&self, id: TokenId) -> Option<(FragmentAcknowledgement, AccountId)> {
+            if let (Some(fragment_acknowledgment), Some(token_owner)) = (
+                self.fragment_acknowledgments.get(id),
+                self.token_owner.get(id),
+            ) {
+                Some((fragment_acknowledgment, token_owner))
+            } else {
+                None
+            }
+        }
+
+        /// Returns the fragment acknowledgment for the given token ID.
+        #[ink(message)]
+        pub fn get_fragment_acknowledgment(&self, id: TokenId) -> Option<FragmentAcknowledgement> {
+            self.fragment_acknowledgments.get(id)
         }
 
         /// Transfers token `id` `from` the sender to the `to` `AccountId`.
@@ -376,6 +492,20 @@ mod fa_nft {
                     || self.token_approvals.get(id) == Some(from)
                     || self.approved_for_all(owner, from))
         }
+
+        /// Ensures that the caller is the contract owner.
+        fn ensure_owner(&self) {
+            assert!(
+                self.is_owner(self.env().caller()),
+                "Caller is not the contract owner"
+            );
+        }
+    }
+
+    impl Default for FaNft {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     /// Unit tests
@@ -388,97 +518,141 @@ mod fa_nft {
         fn mint_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Token 1 does not exists.
-            assert_eq!(fa_nft.owner_of(1), None);
+            let mut fa_nft = FaNft::default();
+            let token_id: TokenId =
+                TokenRef(FragmentCid::default(), accounts.bob, BlockNumber::default()).into();
+            // `token_id` does not exists.
+            assert_eq!(fa_nft.owner_of(token_id), None);
             // Alice does not owns tokens.
-            assert_eq!(fa_nft.balance_of(accounts.alice), 0);
-            // Create token Id 1.
-            assert_eq!(fa_nft.mint(1), Ok(()));
-            // Alice owns 1 token.
-            assert_eq!(fa_nft.balance_of(accounts.alice), 1);
+            assert_eq!(fa_nft.balance_of(accounts.bob), 0);
+            // Create token.
+            assert_eq!(
+                fa_nft.mint(FragmentCid::default(), accounts.bob, BlockNumber::default()),
+                Ok(token_id)
+            );
+            // Bob owns 1 token.
+            assert_eq!(fa_nft.balance_of(accounts.bob), 1);
         }
 
         #[ink::test]
         fn mint_existing_should_fail() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1.
-            assert_eq!(fa_nft.mint(1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            let token_id: TokenId =
+                TokenRef(FragmentCid::default(), accounts.bob, BlockNumber::default()).into();
+            // Create token.
+            assert_eq!(
+                fa_nft.mint(FragmentCid::default(), accounts.bob, BlockNumber::default()),
+                Ok(token_id)
+            );
             // The first Transfer event takes place
             assert_eq!(1, ink::env::test::recorded_events().count());
-            // Alice owns 1 token.
-            assert_eq!(fa_nft.balance_of(accounts.alice), 1);
-            // Alice owns token Id 1.
-            assert_eq!(fa_nft.owner_of(1), Some(accounts.alice));
-            // Cannot create  token Id if it exists.
-            // Bob cannot own token Id 1.
-            assert_eq!(fa_nft.mint(1), Err(Error::TokenExists));
+            // Bob owns 1 token
+            assert_eq!(fa_nft.balance_of(accounts.bob), 1);
+            // Bob owns token
+            assert_eq!(fa_nft.owner_of(token_id), Some(accounts.bob));
+            // Cannot create token Id if it exists.
+            // Token with same ID cannot be minted
+            assert_eq!(
+                fa_nft.mint(FragmentCid::default(), accounts.bob, BlockNumber::default()),
+                Err(Error::TokenExists)
+            );
         }
 
         #[ink::test]
         fn transfer_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1 for Alice
-            assert_eq!(fa_nft.mint(1), Ok(()));
-            // Alice owns token 1
-            assert_eq!(fa_nft.balance_of(accounts.alice), 1);
+            let mut fa_nft = FaNft::default();
             // Bob does not owns any token
             assert_eq!(fa_nft.balance_of(accounts.bob), 0);
+            let token_id =
+                fa_nft.mint(FragmentCid::default(), accounts.bob, BlockNumber::default());
+            // Create token for Bob
+            assert!(token_id.is_ok());
+            // Bob owns 1 token
+            assert_eq!(fa_nft.balance_of(accounts.bob), 1);
+            // Charlie not owns any token
+            assert_eq!(fa_nft.balance_of(accounts.charlie), 0);
             // The first Transfer event takes place
             assert_eq!(1, ink::env::test::recorded_events().count());
-            // Alice transfers token 1 to Bob
-            assert_eq!(fa_nft.transfer(accounts.bob, 1), Ok(()));
+            // Change caller to Bob
+            set_caller(accounts.bob);
+            // Bob transfers token 1 to Charlie
+            assert_eq!(fa_nft.transfer(accounts.charlie, token_id.unwrap()), Ok(()));
             // The second Transfer event takes place
             assert_eq!(2, ink::env::test::recorded_events().count());
-            // Bob owns token 1
-            assert_eq!(fa_nft.balance_of(accounts.bob), 1);
+            // Charlie owns 1 token
+            assert_eq!(fa_nft.balance_of(accounts.charlie), 1);
         }
 
         #[ink::test]
         fn invalid_transfer_should_fail() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let token_id: TokenId = TokenRef(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            )
+            .into();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
+            let mut fa_nft = FaNft::default();
             // Transfer token fails if it does not exists.
-            assert_eq!(fa_nft.transfer(accounts.bob, 2), Err(Error::TokenNotFound));
-            // Token Id 2 does not exists.
-            assert_eq!(fa_nft.owner_of(2), None);
-            // Create token Id 2.
-            assert_eq!(fa_nft.mint(2), Ok(()));
+            assert_eq!(
+                fa_nft.transfer(accounts.bob, token_id),
+                Err(Error::TokenNotFound)
+            );
+            // Token Id does not exists.
+            assert_eq!(fa_nft.owner_of(token_id), None);
+            // Create token.
+            assert_eq!(
+                fa_nft.mint(
+                    FragmentCid::default(),
+                    accounts.alice,
+                    BlockNumber::default()
+                ),
+                Ok(token_id)
+            );
             // Alice owns 1 token.
             assert_eq!(fa_nft.balance_of(accounts.alice), 1);
-            // Token Id 2 is owned by Alice.
-            assert_eq!(fa_nft.owner_of(2), Some(accounts.alice));
+            // Token is owned by Alice.
+            assert_eq!(fa_nft.owner_of(token_id), Some(accounts.alice));
             // Set Bob as caller
             set_caller(accounts.bob);
             // Bob cannot transfer not owned tokens.
-            assert_eq!(fa_nft.transfer(accounts.eve, 2), Err(Error::NotApproved));
+            assert_eq!(
+                fa_nft.transfer(accounts.eve, token_id),
+                Err(Error::NotApproved)
+            );
         }
 
         #[ink::test]
         fn approved_transfer_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1.
-            assert_eq!(fa_nft.mint(1), Ok(()));
-            // Token Id 1 is owned by Alice.
-            assert_eq!(fa_nft.owner_of(1), Some(accounts.alice));
-            // Approve token Id 1 transfer for Bob on behalf of Alice.
-            assert_eq!(fa_nft.approve(accounts.bob, 1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token.
+            let token_id = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_id.is_ok());
+            let token_id = token_id.unwrap();
+            // Token is owned by Alice.
+            assert_eq!(fa_nft.owner_of(token_id), Some(accounts.alice));
+            // Approve token transfer for Bob on behalf of Alice.
+            assert_eq!(fa_nft.approve(accounts.bob, token_id), Ok(()));
             // Set Bob as caller
             set_caller(accounts.bob);
             // Bob transfers token Id 1 from Alice to Eve.
             assert_eq!(
-                fa_nft.transfer_from(accounts.alice, accounts.eve, 1),
+                fa_nft.transfer_from(accounts.alice, accounts.eve, token_id),
                 Ok(())
             );
             // TokenId 3 is owned by Eve.
-            assert_eq!(fa_nft.owner_of(1), Some(accounts.eve));
+            assert_eq!(fa_nft.owner_of(token_id), Some(accounts.eve));
             // Alice does not owns tokens.
             assert_eq!(fa_nft.balance_of(accounts.alice), 0);
             // Bob does not owns tokens.
@@ -491,11 +665,23 @@ mod fa_nft {
         fn approved_for_all_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1.
-            assert_eq!(fa_nft.mint(1), Ok(()));
-            // Create token Id 2.
-            assert_eq!(fa_nft.mint(2), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token 1.
+            let token_1 = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_1.is_ok());
+            let token_1 = token_1.unwrap();
+            // Create token 2.
+            let token_2 = fa_nft.mint(
+                FragmentCid::default() + 1,
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_2.is_ok());
+            let token_2 = token_2.unwrap();
             // Alice owns 2 tokens.
             assert_eq!(fa_nft.balance_of(accounts.alice), 2);
             // Approve token Id 1 transfer for Bob on behalf of Alice.
@@ -504,18 +690,18 @@ mod fa_nft {
             assert!(fa_nft.is_approved_for_all(accounts.alice, accounts.bob));
             // Set Bob as caller
             set_caller(accounts.bob);
-            // Bob transfers token Id 1 from Alice to Eve.
+            // Bob transfers token 1 from Alice to Eve.
             assert_eq!(
-                fa_nft.transfer_from(accounts.alice, accounts.eve, 1),
+                fa_nft.transfer_from(accounts.alice, accounts.eve, token_1),
                 Ok(())
             );
-            // TokenId 1 is owned by Eve.
-            assert_eq!(fa_nft.owner_of(1), Some(accounts.eve));
+            // Token 1 is owned by Eve.
+            assert_eq!(fa_nft.owner_of(token_1), Some(accounts.eve));
             // Alice owns 1 token.
             assert_eq!(fa_nft.balance_of(accounts.alice), 1);
-            // Bob transfers token Id 2 from Alice to Eve.
+            // Bob transfers token 2 from Alice to Eve.
             assert_eq!(
-                fa_nft.transfer_from(accounts.alice, accounts.eve, 2),
+                fa_nft.transfer_from(accounts.alice, accounts.eve, token_2),
                 Ok(())
             );
             // Bob does not own tokens.
@@ -533,7 +719,7 @@ mod fa_nft {
         fn approve_nonexistent_token_should_fail() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
+            let mut fa_nft = FaNft::default();
             // Approve transfer of nonexistent token id 1
             assert_eq!(fa_nft.approve(accounts.bob, 1), Err(Error::TokenNotFound));
         }
@@ -542,9 +728,14 @@ mod fa_nft {
         fn not_approved_transfer_should_fail() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1.
-            assert_eq!(fa_nft.mint(1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token.
+            let token_id = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_id.is_ok());
             // Alice owns 1 token.
             assert_eq!(fa_nft.balance_of(accounts.alice), 1);
             // Bob does not owns tokens.
@@ -555,7 +746,7 @@ mod fa_nft {
             set_caller(accounts.eve);
             // Eve is not an approved operator by Alice.
             assert_eq!(
-                fa_nft.transfer_from(accounts.alice, accounts.frank, 1),
+                fa_nft.transfer_from(accounts.alice, accounts.frank, token_id.unwrap()),
                 Err(Error::NotApproved)
             );
             // Alice owns 1 token.
@@ -570,25 +761,31 @@ mod fa_nft {
         fn burn_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1 for Alice
-            assert_eq!(fa_nft.mint(1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token for Alice
+            let token_id = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_id.is_ok());
+            let token_id = token_id.unwrap();
             // Alice owns 1 token.
             assert_eq!(fa_nft.balance_of(accounts.alice), 1);
-            // Alice owns token Id 1.
-            assert_eq!(fa_nft.owner_of(1), Some(accounts.alice));
-            // Destroy token Id 1.
-            assert_eq!(fa_nft.burn(1), Ok(()));
-            // Alice does not owns tokens.
+            // Alice owns token.
+            assert_eq!(fa_nft.owner_of(token_id), Some(accounts.alice));
+            // Destroy token.
+            assert_eq!(fa_nft.burn(token_id), Ok(()));
+            // Alice does not own tokens.
             assert_eq!(fa_nft.balance_of(accounts.alice), 0);
-            // Token Id 1 does not exists
-            assert_eq!(fa_nft.owner_of(1), None);
+            // Token does not exists
+            assert_eq!(fa_nft.owner_of(token_id), None);
         }
 
         #[ink::test]
         fn burn_fails_token_not_found() {
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
+            let mut fa_nft = FaNft::default();
             // Try burning a non existent token
             assert_eq!(fa_nft.burn(1), Err(Error::TokenNotFound));
         }
@@ -597,32 +794,46 @@ mod fa_nft {
         fn burn_fails_not_owner() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1 for Alice
-            assert_eq!(fa_nft.mint(1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token for Alice
+            let token_id = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_id.is_ok());
             // Try burning this token with a different account
             set_caller(accounts.eve);
-            assert_eq!(fa_nft.burn(1), Err(Error::NotOwner));
+            assert_eq!(fa_nft.burn(token_id.unwrap()), Err(Error::NotOwner));
         }
 
         #[ink::test]
         fn transfer_from_fails_not_owner() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1 for Alice
-            assert_eq!(fa_nft.mint(1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token for Alice
+            let token_1 = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_1.is_ok());
             // Bob can transfer alice's tokens
             assert_eq!(fa_nft.set_approval_for_all(accounts.bob, true), Ok(()));
-            // Set caller to Frank
-            set_caller(accounts.frank);
-            // Create token Id 2 for Frank
-            assert_eq!(fa_nft.mint(2), Ok(()));
+            // Create token for Frank
+            assert!(fa_nft
+                .mint(
+                    FragmentCid::default(),
+                    accounts.frank,
+                    BlockNumber::default()
+                )
+                .is_ok());
             // Set caller to Bob
             set_caller(accounts.bob);
             // Bob makes invalid call to transfer_from (Alice is token owner, not Frank)
             assert_eq!(
-                fa_nft.transfer_from(accounts.frank, accounts.bob, 1),
+                fa_nft.transfer_from(accounts.frank, accounts.bob, token_1.unwrap()),
                 Err(Error::NotOwner)
             );
         }
@@ -631,15 +842,155 @@ mod fa_nft {
         fn transfer_fails_not_owner() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
             // Create a new contract instance.
-            let mut fa_nft = FaNft::new();
-            // Create token Id 1 for Alice
-            assert_eq!(fa_nft.mint(1), Ok(()));
+            let mut fa_nft = FaNft::default();
+            // Create token for Alice
+            let token_id = fa_nft.mint(
+                FragmentCid::default(),
+                accounts.alice,
+                BlockNumber::default(),
+            );
+            assert!(token_id.is_ok());
             // Bob can transfer alice's tokens
             assert_eq!(fa_nft.set_approval_for_all(accounts.bob, true), Ok(()));
             // Set caller to bob
             set_caller(accounts.bob);
-            // Bob makes invalid call to transfer (he is not token owner, Alice is)
-            assert_eq!(fa_nft.transfer(accounts.bob, 1), Err(Error::NotOwner));
+            // Bob makes invalid call to transfer (he is not token owner, Alice is
+            // and should use `transfer_from` instead)
+            assert_eq!(
+                fa_nft.transfer(accounts.bob, token_id.unwrap()),
+                Err(Error::NotOwner)
+            );
+        }
+
+        #[ink::test]
+        fn ownership_can_be_transferred() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            // Create a new contract instance.
+            let mut fa_nft = FaNft::default();
+            // Alice is the contract owner
+            assert_eq!(fa_nft.contract_owner, accounts.alice);
+            fa_nft.transfer_ownership(accounts.bob);
+            // Bob is now contract owner
+            assert_eq!(fa_nft.contract_owner, accounts.bob);
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Caller is not the contract owner")]
+        fn ownership_cant_be_transferred_if_not_owner() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            // Create a new contract instance.
+            let mut fa_nft = FaNft::default();
+            // Set caller to Bob
+            set_caller(accounts.bob);
+            fa_nft.transfer_ownership(accounts.bob)
+        }
+
+        #[ink::test]
+        fn transfer_balance_works() {
+            let mut fa_nft = FaNft::default();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            // Alice is owner
+            // Transfer some balance
+            fa_nft.transfer_balance(accounts.bob, 50);
+        }
+
+        #[ink::test]
+        #[should_panic(expected = "Caller is not the contract owner")]
+        fn transfer_balance_fails_if_not_contract_owner() {
+            let mut fa_nft = FaNft::default();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            // Set the contract owner to a different account
+            fa_nft.contract_owner = accounts.eve;
+
+            // Attempt to transfer balance should fail
+            let _ = fa_nft.transfer_balance(accounts.bob, 50);
+        }
+
+        #[ink::test]
+        fn get_fa_info_works() {
+            let mut fa_nft = FaNft::default();
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+
+            // Initialize some data
+            let token_id = 1;
+            let fragment_acknowledgment = FragmentAcknowledgement::default();
+            let owner = accounts.alice;
+
+            // Set the data in the contract
+            fa_nft
+                .fragment_acknowledgments
+                .insert(token_id, &fragment_acknowledgment);
+            fa_nft.token_owner.insert(token_id, &owner);
+
+            // Call get_fa_info and check the result
+            let result = fa_nft.get_fa_info(token_id);
+            assert_eq!(result, Some((fragment_acknowledgment, owner)));
+        }
+
+        #[ink::test]
+        fn get_fa_info_returns_none_if_not_found() {
+            let fa_nft = FaNft::new();
+
+            // Call get_fa_info with a non-existent token ID
+            let result = fa_nft.get_fa_info(1);
+            assert_eq!(result, None);
+        }
+
+        #[ink::test]
+        fn get_fragment_acknowledgment_works() {
+            let mut fa_nft = FaNft::default();
+
+            // Initialize some data
+            let token_id = 1;
+            let fragment_acknowledgment = FragmentAcknowledgement::default();
+            // Set the data in the contract
+            fa_nft
+                .fragment_acknowledgments
+                .insert(token_id, &fragment_acknowledgment);
+
+            // Call get_fragment_acknowledgment and check the result
+            let result = fa_nft.get_fragment_acknowledgment(token_id);
+            assert_eq!(result, Some(fragment_acknowledgment));
+        }
+
+        #[ink::test]
+        fn get_fragment_acknowledgment_returns_none_if_not_found() {
+            let fa_nft = FaNft::new();
+
+            // Call get_fragment_acknowledgment with a non-existent token ID
+            let result = fa_nft.get_fragment_acknowledgment(1);
+            assert_eq!(result, None);
+        }
+
+        #[ink::test]
+        fn owner_returns_correct_owner() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let fa_nft = FaNft::default();
+            assert_eq!(fa_nft.owner(), accounts.alice);
+        }
+
+        #[ink::test]
+        fn is_owner_returns_true_for_owner() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let fa_nft = FaNft::default();
+            assert!(fa_nft.is_owner(accounts.alice));
+        }
+
+        #[ink::test]
+        fn is_owner_returns_false_for_non_owner() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let fa_nft = FaNft::default();
+            assert!(!fa_nft.is_owner(accounts.bob));
+        }
+
+        #[ink::test]
+        fn renounce_ownership_works() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let mut fa_nft = FaNft::default();
+            fa_nft.renounce_ownership();
+            assert!(!fa_nft.is_owner(accounts.alice));
         }
 
         fn set_caller(sender: AccountId) {

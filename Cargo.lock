@@ -253,6 +253,8 @@ name = "fa-nft"
 version = "0.1.0"
 dependencies = [
  "ink",
+ "trait-ownable",
+ "trait-transferable",
 ]
 
 [[package]]
@@ -275,6 +277,8 @@ dependencies = [
  "fa-nft",
  "ink",
  "sha3",
+ "trait-ownable",
+ "trait-transferable",
 ]
 
 [[package]]
@@ -1140,6 +1144,20 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "winnow",
+]
+
+[[package]]
+name = "trait-ownable"
+version = "0.1.0"
+dependencies = [
+ "ink",
+]
+
+[[package]]
+name = "trait-transferable"
+version = "0.1.0"
+dependencies = [
+ "ink",
 ]
 
 [[package]]

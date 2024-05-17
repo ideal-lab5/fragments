@@ -4,22 +4,19 @@
 mod fragments_round {
     use ckb_merkle_mountain_range::{Merge, MerkleProof, Result as MMRResult};
     use core::marker::PhantomData;
+    use fa_nft::FaNftRef;
     use ink::prelude::{vec, vec::Vec};
+    use ink::ToAccountId;
+    use ownable::Ownable;
     use sha3::Digest;
 
     #[ink(storage)]
     pub struct FragmentsRound {
-        fragment_details: Vec<FragmentDetails>,
+        fragments: Vec<Fragment>,
         /// the FA Nft contract AccountId
         fa_nft: AccountId,
         mmr_root: Vec<u8>,
-    }
-
-    #[ink::scale_derive(Decode, Encode, TypeInfo)]
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct FragmentDetails {
-        cid: u32,
-        release_block: u32,
+        contract_owner: AccountId,
     }
 
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
@@ -74,12 +71,53 @@ mod fragments_round {
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[derive(PartialEq, Debug)]
     pub enum Error {
-        DetailsNotFound,
+        NotFound,
         /// The fragment can't be proven. This does not mean that the fragment is invalid.
         /// But something went wrong during the proof verification.
         CantBeProven,
         ProofInvalid,
+        FaNFT(fa_nft::Error),
     }
+
+    #[ink::scale_derive(Decode, Encode, TypeInfo)]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Fragment {
+        cid: u32,
+        mmr_pos: u64,
+        release_block: u32,
+    }
+
+    impl Ownable for FragmentsRound {
+        #[ink(message)]
+        fn owner(&self) -> AccountId {
+            self.contract_owner
+        }
+
+        #[ink(message)]
+        fn is_owner(&self, account: AccountId) -> bool {
+            self.contract_owner == account
+        }
+
+        #[ink(message)]
+        fn renounce_ownership(&mut self) {
+            self.ensure_owner();
+            self.contract_owner = AccountId::from([0x0; 32]);
+        }
+
+        #[ink(message)]
+        fn transfer_ownership(&mut self, new_owner: AccountId) {
+            self.ensure_owner();
+            self.contract_owner = new_owner;
+        }
+    }
+
+    // impl Transferable for FragmentsRound {
+    //     #[ink(message)]
+    //     fn transfer_balance(&mut self, to: AccountId, value: Balance) {
+    //         self.ensure_owner();
+    //         self.env().transfer(to, value).unwrap();
+    //     }
+    // }
 
     /// The `FragmentsRound` struct represents a round of fragments.
     /// It contains information about the fragment details, the MMR root, and the Fragment Acknowledge NFT account ID.
@@ -88,23 +126,27 @@ mod fragments_round {
         ///
         /// # Arguments
         ///
-        /// * `fragment_details` - A list of `FragmentDetails` representing the details of each fragment.
-        /// * `mmr_root` - The root of the MMR (Merkle Mountain Range), where each leaf represents a fragment.
-        /// * `fa_nft` - The account ID of the deployed Fragment Acknowledge NFT.
+        /// * `fragments` - A vector of `Fragment` instances, each representing the details of a fragment.
+        /// * `mmr_root` - A byte vector representing the root of the Merkle Mountain Range (MMR), where each leaf corresponds to a fragment.
+        /// * `fa_nft_code_hash` - The code hash of the deployed Fragment Acknowledge NFT (Non-Fungible Token).
         ///
         /// # Returns
         ///
-        /// A new instance of `FragmentsRound`.
+        /// A new instance of `FragmentsRound`. This instance is linked to the Fragment Acknowledge NFT via its code hash, and is initialized with the provided fragments and MMR root.
         #[ink(constructor)]
-        pub fn new(
-            fragment_details: Vec<FragmentDetails>,
-            mmr_root: Vec<u8>,
-            fa_nft: AccountId,
-        ) -> Self {
+        pub fn new(fragments: Vec<Fragment>, mmr_root: Vec<u8>, fa_nft_code_hash: Hash) -> Self {
+            let fa_nft = FaNftRef::new()
+                .code_hash(fa_nft_code_hash)
+                .endowment(0)
+                .salt_bytes([0xde, 0xad, 0xbe, 0xef])
+                .instantiate()
+                .to_account_id();
+
             Self {
-                fragment_details,
+                fragments,
                 fa_nft,
                 mmr_root,
+                contract_owner: Self::env().caller(),
             }
         }
 
@@ -112,10 +154,10 @@ mod fragments_round {
         ///
         /// # Returns
         ///
-        /// A vector of `FragmentDetails` representing all the fragments in this round.
+        /// A vector of `Fragment` representing all the fragments in this round.
         #[ink(message)]
-        pub fn get_fragments(&self) -> Vec<FragmentDetails> {
-            self.fragment_details.clone()
+        pub fn get_fragments(&self) -> Vec<Fragment> {
+            self.fragments.clone()
         }
 
         /// Checks if the fragment is available to be claimed by the caller.
@@ -124,7 +166,7 @@ mod fragments_round {
         /// # Arguments
         ///
         /// * `proof` - The proof of inclusion for the fragment in the MMR.
-        /// * `pos` - The node position of the leaf that represents the fragment in the MMR.
+        /// * `cid` - The content identifier (CID) of the fragment
         /// * `hash` - The hash of the fragment.
         ///
         /// # Returns
@@ -134,37 +176,70 @@ mod fragments_round {
         pub fn claim_fragment(
             &self,
             proof: Proof<Leaf, MergeLeaves>,
-            pos: u64,
+            cid: u32,
             hash: Vec<u8>,
         ) -> Result<(), Error> {
             let mmr_proof: MerkleProof<Leaf, MergeLeaves> = proof.into();
             let verifies = mmr_proof
-                .verify(Leaf(self.mmr_root.clone()), vec![(pos, Leaf::from(hash))])
+                .verify(
+                    Leaf(self.mmr_root.clone()),
+                    vec![(self.get_fragment(cid)?.mmr_pos, Leaf::from(hash))],
+                )
                 .map_err(|_| Error::CantBeProven)?;
             if !verifies {
                 return Err(Error::ProofInvalid);
             }
 
-            self.mint_fragment_acknowledgement(pos)
+            self.mint_fragment_acknowledgement(cid)
         }
 
         /// Checks if the caller is eligible to claim the reward.
         /// If eligible, it calculates the reward and transfers it to the caller.
         #[ink(message)]
-        pub fn claim_reward(&self) {}
+        pub fn claim_reward(&self) -> Result<(), Error> {
+            // todo
+            // calculate the reward and mint it to the caller
+            Ok(())
+        }
 
         /// Mints a fragment acknowledgement for the given position.
         ///
         /// # Arguments
         ///
-        /// * `_pos` - The position of the fragment in the MMR.
+        /// * `cid` - The content identifier (CID) of the fragment for which the acknowledgement is being minted.
         ///
         /// # Returns
         ///
         /// An `Ok` result if the fragment acknowledgement is successfully minted, or an `Err` result with an `Error` if minting fails.
-        fn mint_fragment_acknowledgement(&self, _pos: u64) -> Result<(), Error> {
+        fn mint_fragment_acknowledgement(&self, cid: u32) -> Result<(), Error> {
             // todo
+            // mint FA NFT to the caller with the current block number and the fragment CID
+            let caller = Self::env().caller();
+            let block_number: BlockNumber = Self::env().block_number();
+            let mut fa_nft = self.get_fa_nft_contract();
+            fa_nft
+                .mint(cid, caller, block_number)
+                .map_err(Error::FaNFT)?;
             Ok(())
+        }
+
+        fn get_fragment(&self, cid: u32) -> Result<&Fragment, Error> {
+            self.fragments
+                .iter()
+                .find(|f| f.cid == cid)
+                .ok_or(Error::NotFound)
+        }
+
+        fn get_fa_nft_contract(&self) -> FaNftRef {
+            ink::env::call::FromAccountId::from_account_id(self.fa_nft)
+        }
+
+        /// Ensures that the caller is the contract owner.
+        fn ensure_owner(&self) {
+            assert!(
+                self.is_owner(self.env().caller()),
+                "Caller is not the contract owner"
+            );
         }
     }
 
@@ -172,22 +247,31 @@ mod fragments_round {
     mod tests {
         use super::*;
         use ckb_merkle_mountain_range::util::{MemMMR, MemStore};
-        use ink::primitives::AccountId;
+        use ink::{env::test::DefaultAccounts, primitives::AccountId};
         use std::vec;
 
-        fn mock_fragment_basic() -> FragmentDetails {
-            FragmentDetails {
+        fn mock_fragment() -> Fragment {
+            Fragment {
                 cid: 1,
+                mmr_pos: 10,
                 release_block: 11,
             }
         }
 
-        fn mock_round(mmr_root: Option<Vec<u8>>) -> FragmentsRound {
+        fn mock_round(
+            mmr_root: Option<Vec<u8>>,
+            fragments: Option<Vec<Fragment>>,
+        ) -> FragmentsRound {
             FragmentsRound {
-                fragment_details: [mock_fragment_basic()].to_vec(),
+                fragments: fragments.unwrap_or([mock_fragment()].to_vec()),
                 fa_nft: AccountId::from([0x01; 32]),
                 mmr_root: mmr_root.unwrap_or(Vec::<u8>::default()),
+                contract_owner: accounts().alice,
             }
+        }
+
+        fn accounts() -> DefaultAccounts<ink::env::DefaultEnvironment> {
+            ink::env::test::default_accounts::<ink::env::DefaultEnvironment>()
         }
 
         fn mock_proof() -> Proof<Leaf, MergeLeaves> {
@@ -200,15 +284,15 @@ mod fragments_round {
 
         #[ink::test]
         fn it_returns_fragments() {
-            let round = mock_round(None);
-            assert_eq!(round.get_fragments(), [mock_fragment_basic()].to_vec());
+            let round = mock_round(None, None);
+            assert_eq!(round.get_fragments(), [mock_fragment()].to_vec());
         }
 
         #[ink::test]
         fn it_cant_claim_fragment_with_invalid_proof() {
-            let round = mock_round(None);
+            let round = mock_round(None, Some(vec![mock_fragment()]));
             assert_eq!(
-                round.claim_fragment(mock_proof(), 0, vec![0x01]),
+                round.claim_fragment(mock_proof(), 1, vec![0x01]),
                 Err(Error::ProofInvalid)
             );
         }
@@ -263,21 +347,22 @@ mod fragments_round {
             let root = mmr.get_root().expect("get root");
 
             // 3. Create a new FragmentRound with the MMR root.
-            let round = mock_round(Some(root.0));
-
-            // 4. Generate a proof for a leaf.
             // The element that we know the proof for is 5.
             let proof_elem: u32 = 5;
+            let fragment = Fragment {
+                cid: 1,
+                mmr_pos: positions[proof_elem as usize],
+                release_block: 11,
+            };
+            let round = mock_round(Some(root.0), Some(vec![fragment.clone()]));
+
+            // 4. Generate a proof for a leaf.
             let proof = mmr
                 .gen_proof(vec![positions[proof_elem as usize]])
                 .expect("gen proof");
 
             assert_eq!(
-                round.claim_fragment(
-                    proof.into(),
-                    positions[proof_elem as usize],
-                    mock_hash_from_elem(proof_elem)
-                ),
+                round.claim_fragment(proof.into(), fragment.cid, mock_hash_from_elem(proof_elem)),
                 Ok(())
             );
         }
